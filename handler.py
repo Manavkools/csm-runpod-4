@@ -1,11 +1,11 @@
-# handler.py
+# handler.py (improved)
 import os
 import io
 import base64
 import traceback
+import importlib
 import torch
 import soundfile as sf
-import importlib
 from transformers import AutoProcessor
 import runpod
 
@@ -20,18 +20,19 @@ processor = None
 model = None
 ModelClass = None
 
+# Prefer top-level CSM import, fallback to modeling module or AutoModel
 def _try_import_csm():
     try:
         from transformers import CsmForConditionalGeneration
-        print("[handler] Imported CsmForConditionalGeneration.")
+        print("[handler] Imported CsmForConditionalGeneration (top-level).")
         return CsmForConditionalGeneration
     except Exception:
-        print("[handler] CsmForConditionalGeneration not found in top-level.")
+        print("[handler] CsmForConditionalGeneration not found at top-level.")
     try:
         mod = importlib.import_module("transformers.models.csm.modeling_csm")
         cls = getattr(mod, "CsmForConditionalGeneration", None)
         if cls:
-            print("[handler] Imported CsmForConditionalGeneration from modeling_csm.")
+            print("[handler] Imported CsmForConditionalGeneration from transformers.models.csm.modeling_csm.")
             return cls
     except Exception:
         pass
@@ -39,53 +40,63 @@ def _try_import_csm():
     from transformers import AutoModelForConditionalGeneration
     return AutoModelForConditionalGeneration
 
+# Helper to select correct HF token kwarg for different HF versions
+def _hf_token_kwargs():
+    if not HF_TOKEN:
+        return {}
+    # newer HF versions accept token=..., older use use_auth_token=...
+    return {"token": HF_TOKEN} if "token" in importlib.import_module("inspect").signature(AutoProcessor.from_pretrained).parameters else {"use_auth_token": HF_TOKEN}
+
 def load_model_runtime():
     global processor, model, ModelClass
     if processor is None:
         print(f"[handler] Loading processor for {MODEL_NAME} ...")
-        kwargs = {}
-        if HF_TOKEN:
-            kwargs["use_auth_token"] = HF_TOKEN
-        processor = AutoProcessor.from_pretrained(MODEL_NAME, **kwargs)
-        print("[handler] Processor loaded.")
+        try:
+            processor = AutoProcessor.from_pretrained(MODEL_NAME, **_hf_token_kwargs())
+            print("[handler] Processor loaded.")
+        except Exception as e:
+            print("[handler] Processor load failed:", e)
+            raise
+
     if model is None:
         ModelClass = _try_import_csm()
-        kwargs = {}
-        if HF_TOKEN:
-            kwargs["use_auth_token"] = HF_TOKEN
+        load_kwargs = _hf_token_kwargs()
+        # Try device_map first on GPU
         if device == "cuda":
+            # attempt to load with device_map and float16 to reduce memory
             try:
-                print("[handler] Attempting model.load with device_map='auto', torch_dtype=float16 ...")
-                model = ModelClass.from_pretrained(MODEL_NAME, device_map="auto", torch_dtype=torch.float16, **kwargs)
+                print("[handler] Attempting to load model with device_map='auto' and torch_dtype=float16 ...")
+                model = ModelClass.from_pretrained(MODEL_NAME, device_map="auto", torch_dtype=torch.float16, **load_kwargs)
                 print("[handler] Model loaded with device_map='auto'.")
             except Exception as e:
-                print("[handler] device_map load failed:", e)
-                print("[handler] Loading model normally and moving to device...")
-                model = ModelClass.from_pretrained(MODEL_NAME, **kwargs)
+                print("[handler] device_map load failed, trying fallback load:", e)
                 try:
-                    model.to(device)
-                    print("[handler] Model moved to device:", device)
-                except Exception as me:
-                    print("[handler] Warning moving model to device failed:", me)
+                    model = ModelClass.from_pretrained(MODEL_NAME, **load_kwargs)
+                    try:
+                        model.to(device)
+                        print("[handler] Model moved to device:", device)
+                    except Exception as me:
+                        print("[handler] Warning moving model to device failed:", me)
+                except Exception as e2:
+                    print("[handler] Full fallback load failed:", e2)
+                    raise
         else:
-            print("[handler] Device is CPU; loading model on CPU.")
-            model = ModelClass.from_pretrained(MODEL_NAME, **kwargs)
+            print("[handler] Loading model on CPU ...")
+            model = ModelClass.from_pretrained(MODEL_NAME, **load_kwargs)
             print("[handler] Model loaded on CPU.")
+
         if hasattr(model, "eval"):
             model.eval()
-        print("[handler] Model & processor loaded successfully at runtime. Model type:", type(model))
+        print("[handler] Model & processor ready. Model type:", type(model))
 
-# Try to load model at import time (if built properly)
+# Try one-time load on import (will fallback to runtime)
 try:
-    print("[handler] Checking if model already loaded in image ...")
-    # If we can instantiate the class (empty init) maybe okay; otherwise load
-    _ = None
+    print("[handler] Import-time: checking model availability...")
     if model is None:
         load_model_runtime()
 except Exception as e:
-    print("[handler] Exception in import-time load:", e)
+    print("[handler] Import-time load failed (will attempt runtime). Error:", e)
     traceback.print_exc()
-    print("[handler] Will continue, but requests may trigger runtime load.")
 
 def _audio_to_wav_bytes(audio_array, samplerate=DEFAULT_SAMPLING_RATE):
     import numpy as np
@@ -109,20 +120,23 @@ def _audio_to_wav_bytes(audio_array, samplerate=DEFAULT_SAMPLING_RATE):
 def synthesize(text: str, speaker: str = None) -> bytes:
     global processor, model
     if processor is None or model is None:
-        print("[handler] Model or processor not ready — loading now at runtime.")
+        print("[handler] Processor/model not ready — loading at runtime.")
         load_model_runtime()
+
     inputs = processor(text, add_special_tokens=True, return_tensors="pt")
-    inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k,v in inputs.items()}
+    inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+
     with torch.no_grad():
         try:
             outputs = model.generate(**inputs, output_audio=True)
-            print("[handler] model.generate(..., output_audio=True) succeeded.")
+            print("[handler] generate(..., output_audio=True) OK.")
         except TypeError:
-            print("[handler] generate() with output_audio not supported, retrying...")
+            print("[handler] generate(..., output_audio=True) not supported, retrying without that kwarg.")
             outputs = model.generate(**inputs)
         except Exception as e:
-            print("[handler] model.generate threw exception:", e)
+            print("[handler] model.generate() raised:", e)
             raise
+
     audio = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
     if isinstance(audio, dict) and "audio" in audio:
         audio = audio["audio"]
@@ -137,8 +151,8 @@ def handler(job):
     if not text or not isinstance(text, str) or not text.strip():
         return {"error": "Missing required 'text' (non-empty string)."}
     text = text.strip()
-    if speaker is not None and isinstance(speaker,(str,int)):
-        if isinstance(speaker,int) or (isinstance(speaker,str) and speaker.isdigit()):
+    if speaker is not None and isinstance(speaker, (str, int)):
+        if isinstance(speaker, int) or (isinstance(speaker, str) and speaker.isdigit()):
             if not text.startswith("["):
                 text = f"[{speaker}]" + text
     try:
@@ -149,6 +163,8 @@ def handler(job):
         tb = traceback.format_exc()
         print("[handler] Exception during inference:", e)
         print(tb)
+        # Raise so RunPod records a failure and shows the traceback
         raise RuntimeError(f"Inference failed: {e}\n{tb}")
 
+# Start the RunPod serverless loop (RunPod will call handler when /run is hit)
 runpod.serverless.start({"handler": handler})
