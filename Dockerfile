@@ -24,11 +24,12 @@ ENV HF_HOME=/workspace/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface
 
 # Arguments (passed during build)
-ARG HF_TOKEN
 ARG MODEL_NAME=sesame/csm-1b
 
 # Pass through to environment so Python sees them
-ENV HF_TOKEN=${HF_TOKEN}
+# WARNING: Hardcoding secrets like HF_TOKEN is a security risk.
+# See "Recommended Method" below.
+ENV HF_TOKEN=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
 ENV MODEL_NAME=${MODEL_NAME}
 
 # Attempt to pre-download model at build time (safe fallback)
@@ -37,12 +38,14 @@ import os, traceback
 print(f"[build] Attempting to pre-download: {os.getenv('MODEL_NAME')}")
 try:
     from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(os.getenv("MODEL_NAME"), use_auth_token=os.getenv("HF_TOKEN"))
+    # Note: Using 'token' is preferred for newer HF versions
+    # The handler.py logic correctly handles both 'token' and 'use_auth_token'
+    processor = AutoProcessor.from_pretrained(os.getenv("MODEL_NAME"), token=os.getenv("HF_TOKEN"))
     from transformers import CsmForConditionalGeneration
-    model = CsmForConditionalGeneration.from_pretrained(os.getenv("MODEL_NAME"), use_auth_token=os.getenv("HF_TOKEN"))
+    model = CsmForConditionalGeneration.from_pretrained(os.getenv("MODEL_NAME"), token=os.getenv("HF_TOKEN"))
     print("[build] ✅ Model pre-downloaded successfully.")
 except Exception as e:
-    print("[build] ⚠️ Model download failed, will fallback to runtime load.")
+    print("\n[build] ⚠️ Model download failed, will fallback to runtime load.")
     traceback.print_exc()
 PYCODE
 
