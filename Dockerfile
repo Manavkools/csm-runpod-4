@@ -1,45 +1,57 @@
-# Dockerfile
+# ===============================
+# 🚀 CSM RunPod Serverless Dockerfile
+# ===============================
 FROM python:3.10-slim
 
+# Prevent interactive prompts during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Install essential build and audio libs
 RUN apt-get update && \
-    apt-get install -y build-essential libsndfile1 git && \
+    apt-get install -y --no-install-recommends \
+        build-essential git ffmpeg libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Copy dependency list and install
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install -r requirements.txt
 
-# Set env vars for caching (optional)
+# Setup cache locations for Hugging Face
 ENV HF_HOME=/workspace/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface
 
-# Build‐time model download attempt
+# Arguments (passed during build)
 ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
-ENV MODEL_NAME=sesame/csm-1b
+ARG MODEL_NAME=sesame/csm-1b
 
+# Pass through to environment so Python sees them
+ENV HF_TOKEN=${HF_TOKEN}
+ENV MODEL_NAME=${MODEL_NAME}
+
+# Attempt to pre-download model at build time (safe fallback)
 RUN python3 - <<'PYCODE'
-import os, sys, traceback
-from transformers import AutoProcessor
+import os, traceback
+print(f"[build] Attempting to pre-download: {os.getenv('MODEL_NAME')}")
 try:
-    print("[build] Attempting to download model:", os.getenv("MODEL_NAME"))
-    # Download processor
-    AutoProcessor.from_pretrained(os.getenv("MODEL_NAME"), use_auth_token=os.getenv("HF_TOKEN"))
-    # Attempt model load
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(os.getenv("MODEL_NAME"), use_auth_token=os.getenv("HF_TOKEN"))
     from transformers import CsmForConditionalGeneration
-    CsmForConditionalGeneration.from_pretrained(os.getenv("MODEL_NAME"), use_auth_token=os.getenv("HF_TOKEN"))
-    print("[build] Model download and load successful at build time.")
+    model = CsmForConditionalGeneration.from_pretrained(os.getenv("MODEL_NAME"), use_auth_token=os.getenv("HF_TOKEN"))
+    print("[build] ✅ Model pre-downloaded successfully.")
 except Exception as e:
-    print("[build] Build-time model download/load failed:", e)
+    print("[build] ⚠️ Model download failed, will fallback to runtime load.")
     traceback.print_exc()
-    print("[build] Proceeding, will load model at runtime instead.")
 PYCODE
 
-# Copy handler
+# Copy source code
 COPY handler.py .
 
-# Expose port if needed (most serverless images don't need manual exposure)
-CMD ["python", "handler.py"]
+# Environment defaults
+ENV PYTHONUNBUFFERED=1
+ENV RUNPOD_DEBUG_LEVEL=info
+
+# Entrypoint for RunPod serverless worker
+CMD ["python3", "handler.py"]
