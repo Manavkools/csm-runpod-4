@@ -13,8 +13,9 @@ tqdm
 h5py
 python-dotenv
 git+https://github.com/SesameAILabs/silentcipher@master
+moshi==0.2.2
 # optional extras you can add later if needed:
-# moshi==0.2.2
+moshi==0.2.2
 # torchtune==0.4.0
 # torchao==0.9.0
 # wandb==0.19.6
