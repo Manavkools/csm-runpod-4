@@ -10,7 +10,7 @@ from transformers import AutoProcessor
 import runpod
 
 MODEL_NAME = os.getenv("MODEL_NAME", "sesame/csm-1b")
-HF_TOKEN = os.getenv("HF_TOKEN", None)
+HF_TOKEN = "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"
 DEFAULT_SAMPLING_RATE = int(os.getenv("SAMPLING_RATE", "24000"))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
